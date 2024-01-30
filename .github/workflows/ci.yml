@@ -1,0 +1,205 @@
+---
+name: CI
+run-name: "Tortuga Deploy a Resource Group"
+
+on:
+  # pull_request:
+  workflow_dispatch:
+
+env:
+  TERRAFORM_VERSION: 1.1.6
+  LOCATION: eastus
+  ARM_LOCATION: eastus
+  ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+jobs:
+  lint-all:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Lint code base
+        uses: docker://ghcr.io/github/super-linter:slim-v4
+        env:
+          DEFAULT_BRANCH: develop
+          FILTER_REGEX_EXCLUDE: .*(test.*\.py|test\/)+.*
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATE_ALL_CODEBASE: false
+          VALIDATE_CLOUDFORMATION: false
+          VALIDATE_STATES: false
+          VALIDATE_TERRAFORM_TERRASCAN: false
+          SHELLCHECK_OPTS: "-e SC2030 -e SC2031"
+
+  terraform-fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Format
+        id: fmt
+        run: find app/stacks/* -type d | grep -v tfvars | awk '{print "terraform fmt -check -diff "$1}' | sh
+
+  validate-all:
+    runs-on: ubuntu-latest
+    needs:
+      - terraform-fmt
+    strategy:
+      matrix:
+        env:
+          #- staging
+          - development
+          #- production
+    environment:
+      name: ${{ matrix.env }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Install Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.0
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Generate token for GitHub App over HTTPS
+        id: generate-token
+        uses: getsentry/action-github-app-token@v1
+        with:
+          app_id: ${{ secrets.UNIVERSAL_GH_APP_ID_CODE }}
+          private_key: ${{ secrets.UNIVERSAL_GH_APP_PRIVATE_KEY_CODE }}
+
+      - name: Configure GitHub over HTTPS
+        run: |
+          git config --global --replace-all url."https://foo:${GH_TOKEN}@github.com/TotalEnergies".insteadOf "ssh://git@github.com/TotalEnergies"
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+
+      - name: Install Terraspace
+        run: |
+          bundle update
+
+      - name: Configure Azure Credentials
+        uses: azure/login@v1
+        with:
+          creds: '{"clientId":"${{ secrets.ARM_CLIENT_ID }}","clientSecret":"${{ secrets.ARM_CLIENT_SECRET }}","subscriptionId":"${{ secrets.ARM_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.ARM_TENANT_ID }}"}'
+
+      - name: "Run az commands"
+        run: |
+          az account show
+          az account set --subscription ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          az configure --defaults location=eastus
+
+      - name: Terraspace validate ALL
+        run: |
+          TS_ENV=${{ matrix.env }} terraspace all validate
+
+      - name: Define Azure Provider
+        run: |
+          TS_ENV=${{ matrix.env }} terraspace all providers
+
+      - name: Show Azure Providers
+        run: |
+          # shellcheck disable=SC2086
+          for i in log/providers/*.log
+              do
+                echo "$i"
+                echo ""
+                cat $i
+                echo ""
+              done
+
+  plan-all:
+    runs-on: ubuntu-latest
+    needs:
+      - validate-all
+      - lint-all
+    strategy:
+      matrix:
+        env:
+          #- staging
+          - development
+          #- production
+    environment:
+      name: ${{ matrix.env }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Install Ruby
+        uses: ruby/setup-ruby@477b21f02be01bcb8030d50f37cfec92bfa615b6
+        with:
+          ruby-version: 3.0
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install Terraspace
+        run: |
+          bundle update
+
+      - name: Configure Azure Credentials
+        uses: azure/login@v1
+        with:
+          creds: '{"clientId":"${{ secrets.ARM_CLIENT_ID }}","clientSecret":"${{ secrets.ARM_CLIENT_SECRET }}","subscriptionId":"${{ secrets.ARM_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.ARM_TENANT_ID }}"}'
+
+      - name: Generate token for GitHub App over HTTPS
+        id: generate-token
+        uses: getsentry/action-github-app-token@v1
+        with:
+          app_id: ${{ secrets.UNIVERSAL_GH_APP_ID_CODE }}
+          private_key: ${{ secrets.UNIVERSAL_GH_APP_PRIVATE_KEY_CODE }}
+
+      - name: Configure GitHub over HTTPS
+        run: |
+          git config --global --replace-all url."https://foo:${GH_TOKEN}@github.com/TotalEnergies".insteadOf "ssh://git@github.com/TotalEnergies"
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+
+      - name: Terraspace all plan
+        run: |
+          TS_ENV=${{ matrix.env }} terraspace all plan --no-exit-on-fail
+          # shellcheck disable=SC2086
+          for i in log/plan/*.log
+            do
+            echo "$i"
+            (! grep "has not been deployed yet" ${i} >/dev/null && grep -A15 "Error: " ${i}) && KO=1 || KO=0
+            echo ""
+            echo ""
+            [[ ${KO} -eq 1 ]] && ERR=1
+            done
+          [[ ${ERR} -eq 1 ]] && exit 1
+          exit 0
+
+      - name: Show PLANs
+        run: |
+          # shellcheck disable=SC2086
+          for i in log/plan/*.log
+            do
+              echo "$i"
+              echo ""
+              cat $i
+              echo ""
+            done
