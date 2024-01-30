@@ -1,1 +1,9 @@
-# This is where you put your variables declaration
+#########################################################
+# Global & Common Variables for Application
+#########################################################
+variable "m_location" {
+  type        = string
+  description = "Location where resources should be deployed"
+  default     = "Central US"
+}
+
